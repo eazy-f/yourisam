@@ -1,0 +1,6 @@
+[package]
+name = "yourisam"
+version = "0.0.1"
+authors = ["Nikita Lebedev <eazy-f@yandex.ru>"]
+
+[dependencies]
