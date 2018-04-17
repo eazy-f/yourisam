@@ -7,11 +7,11 @@ use std::io::{Result,SeekFrom};
 static INDEX_EXT: &str = ".MYI";
 static DATA_EXT: &str = ".MYD";
 
-type MITableOptions = u64;
+type MITableOptions = u32;
 
-const MI_OPTION_PACK_RECORD:     u64 = 1;
-const MI_OPTION_PACK_KEYS:       u64 = 2;
-const MI_OPTION_COMPRESS_RECORD: u64 = 4;
+const MI_OPTION_PACK_RECORD:     u32 = 1;
+const MI_OPTION_PACK_KEYS:       u32 = 2;
+const MI_OPTION_COMPRESS_RECORD: u32 = 4;
 
 struct MITableFiles {
     index: String,
@@ -19,7 +19,13 @@ struct MITableFiles {
 }
 
 struct MITableHeader {
-    options: MITableOptions
+    options: MITableOptions,
+    keys: u8,
+    uniques: u8,
+    key_parts: u32,
+    unique_key_parts: u32,
+    fulltext_keys: u8,
+    base_pos: u32
 }
 
 trait Show {
@@ -61,13 +67,51 @@ fn find_table_files(directory: &String, table_name: &String) -> MITableFiles {
 
 fn read_table_header(index_file: &String) -> Result<MITableHeader> {
     let mut index = File::open(index_file)?;
-    let mut header_bytes = [0; 32];
+    let mut header_bytes = [0u8; 32];
+    let mut keyseg_buf = [0u8; 18];
     index.read(&mut header_bytes)?;
-    let options = header_bytes[4..6].iter().fold(0, |acc, &b| acc*256 + b as u64);
     let header = MITableHeader {
-        options: options
+        options: to_u32(&header_bytes[4..6]),
+        base_pos: to_u32(&header_bytes[12..14]),
+        key_parts: to_u32(&header_bytes[14..16]),
+        unique_key_parts: to_u32(&header_bytes[16..18]),
+        keys: header_bytes[18],
+        uniques: header_bytes[19],
+        fulltext_keys: header_bytes[22]
     };
+    let mut keydef_buf = [0u8; 12];
+    let mut uniquedef_buf = [0u8; 4];
+    let mut keys = header.keys;
+    let mut offset = header.base_pos as i64 + 100;
+    index.seek(SeekFrom::Start(header.base_pos as u64 + 100))?;
+    while 0 != keys {
+        let read = index.read(&mut keydef_buf)?;
+        let keysegs = keydef_buf[0] as i64;
+        println!("keysegs: {} alg: {}", keysegs, keydef_buf[1]);
+        index.seek(SeekFrom::Current(keysegs * 18))?;
+        keys -= 1;
+        offset += keysegs * 18 + (read as i64);
+    }
+    let mut uniques = header.uniques;
+    while 0 != uniques {
+        let read = index.read(&mut uniquedef_buf)?;
+        let keysegs = to_u32(&uniquedef_buf[0..2]) as i64;
+        println!("keysegs: {} key: {}", keysegs, uniquedef_buf[2]);
+        let mut keysegs_left = keysegs;
+        while 0 != keysegs_left {
+            index.read(&mut keyseg_buf)?;
+            println!("seg type: {} lang {}", keyseg_buf[0], keyseg_buf[1]);
+            keysegs_left -= 1;
+        }
+        uniques -= 1;
+        offset += keysegs * 18 + (read as i64);
+    }
+    println!("keys {} base pos {:x} offset {:x}", header.uniques, header.base_pos, offset);
     Ok(header)
+}
+
+fn to_u32(source: &[u8]) -> u32 {
+    source.iter().fold(0, |acc, &b| acc*256 + b as u32)
 }
 
 fn read_table_records(files: &MITableFiles) -> Result<u64> {
@@ -99,7 +143,7 @@ fn read_table_records(files: &MITableFiles) -> Result<u64> {
         table.read(&mut block_header[0..(header_len-1)]);
         let length_bytes = block_header_block_length_bytes(block_type, &block_header);
         let data_len = length_bytes.iter().fold(0, |acc, &b| acc*256 + b as u32);
-        println!("block at {:016x} type: {} len: {}", position, block_type, data_len);
+        //println!("block at {:016x} type: {} len: {}", position, block_type, data_len);
         let offset = if block_type == 0 {
             0
         } else if block_type == 3 || block_type == 9 {
