@@ -69,6 +69,7 @@ fn read_table_header(index_file: &String) -> Result<MITableHeader> {
     let mut index = File::open(index_file)?;
     let mut header_bytes = [0u8; 32];
     let mut keyseg_buf = [0u8; 18];
+    let mut base_info_buf = [0u8; 100];
     index.read(&mut header_bytes)?;
     let header = MITableHeader {
         options: to_u32(&header_bytes[4..6]),
@@ -82,8 +83,10 @@ fn read_table_header(index_file: &String) -> Result<MITableHeader> {
     let mut keydef_buf = [0u8; 12];
     let mut uniquedef_buf = [0u8; 4];
     let mut keys = header.keys;
-    let mut offset = header.base_pos as i64 + 100;
-    index.seek(SeekFrom::Start(header.base_pos as u64 + 100))?;
+    let mut offset = header.base_pos as i64 + base_info_buf.len() as i64;
+    index.seek(SeekFrom::Start(header.base_pos as u64))?;
+    index.read(&mut base_info_buf)?;
+    let fields = to_u32(&base_info_buf[64..68]);
     while 0 != keys {
         let read = index.read(&mut keydef_buf)?;
         let keysegs = keydef_buf[0] as i64;
@@ -105,6 +108,16 @@ fn read_table_header(index_file: &String) -> Result<MITableHeader> {
         }
         uniques -= 1;
         offset += keysegs * 18 + (read as i64);
+    }
+    let mut fields_left = fields;
+    let mut fieldrec_buf = [0u8; 7];
+    while 0 != fields_left {
+        index.read(&mut fieldrec_buf);
+        println!("field: {}, type: {}, length: {}",
+                 fields - fields_left,
+                 to_u32(&fieldrec_buf[0..2]),
+                 to_u32(&fieldrec_buf[2..4]));
+        fields_left -= 1;
     }
     println!("keys {} base pos {:x} offset {:x}", header.uniques, header.base_pos, offset);
     Ok(header)
