@@ -3,6 +3,8 @@ use std::fs::File;
 use std::io;
 use std::io::prelude::*;
 use std::io::{Result, SeekFrom, Error, ErrorKind};
+use std::sync::mpsc::{self, Sender, Receiver};
+use std::thread;
 
 static INDEX_EXT: &str = ".MYI";
 static DATA_EXT: &str = ".MYD";
@@ -88,10 +90,9 @@ fn main() {
     let table_name = &args[2];
     let files = find_table_files(directory, table_name);
     let block_types = record_block_definitions();
-    match read_table_records(&files, &block_types) {
-        Ok(records) => println!("{}", records),
-        Err(error) => println!("{}", error)
-    }
+    let (tx, rx) = mpsc::channel();
+    let writer = thread::spawn(move || read_table_records(&files, &block_types, tx).unwrap());
+    write_records(rx);
 }
 
 fn find_table_files(directory: &String, table_name: &String) -> MITableFiles {
@@ -101,6 +102,14 @@ fn find_table_files(directory: &String, table_name: &String) -> MITableFiles {
         index: directory.clone() + &index_file,
         data: directory.clone() + &data_file
     }
+}
+
+fn write_records(reader: Receiver<Vec<u8>>) {
+    let mut messages = 0;
+    for message in reader.iter() {
+        messages += 1;
+    }
+    println!("read {} records", messages);
 }
 
 fn read_table_state(index_file: &String) -> Result<MITableState> {
@@ -167,8 +176,8 @@ fn to_u64(source: &[u8]) -> u64 {
     source.iter().fold(0, |acc, &b| acc*256 + b as u64)
 }
 
-fn read_table_records(files: &MITableFiles, block_types: &[Option<MIRecordBlockDef>])
-                      -> Result<u64> {
+fn read_table_records(files: &MITableFiles, block_types: &[Option<MIRecordBlockDef>],
+                      writer: Sender<Vec<u8>>) -> Result<u64> {
     let mut records = 0;
     let state = read_table_state(&files.index)?;
     let mut table = File::open(&files.data)?;
@@ -225,7 +234,7 @@ fn read_table_records(files: &MITableFiles, block_types: &[Option<MIRecordBlockD
                     table.seek(SeekFrom::Start(next_pos));
                 }
                 if should_read && block_info.next_filepos.is_none() {
-                    println!("record len: {}", record.len());
+                    writer.send(record.clone());
                 }
                 records += 1;
                 result = Ok(records)
