@@ -2,7 +2,7 @@ use std::env;
 use std::fs::File;
 use std::io;
 use std::io::prelude::*;
-use std::io::{Result,SeekFrom};
+use std::io::{Result, SeekFrom, Error, ErrorKind};
 
 static INDEX_EXT: &str = ".MYI";
 static DATA_EXT: &str = ".MYD";
@@ -13,9 +13,46 @@ const MI_OPTION_PACK_RECORD:     u32 = 1;
 const MI_OPTION_PACK_KEYS:       u32 = 2;
 const MI_OPTION_COMPRESS_RECORD: u32 = 4;
 
+type BytePos = (usize, usize);
+
+struct MIRecordBlock {
+    record_len: Option<u32>,
+    data_len: Option<u32>,
+    unused_len: Option<u32>,
+    next_filepos: Option<u64>,
+    block_len: u32,
+    deleted: bool
+}
+
+#[derive(Clone)]
+#[derive(Copy)]
+struct MIRecordBlockDef {
+    record_len: Option<BytePos>,
+    block_len: Option<BytePos>,
+    data_len: Option<BytePos>,
+    unused_len: Option<BytePos>,
+    next_filepos: Option<BytePos>,
+    header_len: u8,
+    deleted: bool
+}
+
 struct MITableFiles {
     index: String,
     data: String
+}
+
+struct MIRecDef {
+    rtype: i16,
+    length: u16
+}
+
+struct MITableBase {
+    records: Vec<MIRecDef>
+}
+
+struct MITableState {
+    header: MITableHeader,
+    base: MITableBase
 }
 
 struct MITableHeader {
@@ -50,7 +87,8 @@ fn main() {
     let directory = &args[1];
     let table_name = &args[2];
     let files = find_table_files(directory, table_name);
-    match read_table_records(&files) {
+    let block_types = record_block_definitions();
+    match read_table_records(&files, &block_types) {
         Ok(records) => println!("{}", records),
         Err(error) => println!("{}", error)
     }
@@ -65,7 +103,7 @@ fn find_table_files(directory: &String, table_name: &String) -> MITableFiles {
     }
 }
 
-fn read_table_header(index_file: &String) -> Result<MITableHeader> {
+fn read_table_state(index_file: &String) -> Result<MITableState> {
     let mut index = File::open(index_file)?;
     let mut header_bytes = [0u8; 32];
     let mut keyseg_buf = [0u8; 18];
@@ -90,7 +128,6 @@ fn read_table_header(index_file: &String) -> Result<MITableHeader> {
     while 0 != keys {
         let read = index.read(&mut keydef_buf)?;
         let keysegs = keydef_buf[0] as i64;
-        println!("keysegs: {} alg: {}", keysegs, keydef_buf[1]);
         index.seek(SeekFrom::Current(keysegs * 18))?;
         keys -= 1;
         offset += keysegs * 18 + (read as i64);
@@ -99,11 +136,9 @@ fn read_table_header(index_file: &String) -> Result<MITableHeader> {
     while 0 != uniques {
         let read = index.read(&mut uniquedef_buf)?;
         let keysegs = to_u32(&uniquedef_buf[0..2]) as i64;
-        println!("keysegs: {} key: {}", keysegs, uniquedef_buf[2]);
         let mut keysegs_left = keysegs;
         while 0 != keysegs_left {
             index.read(&mut keyseg_buf)?;
-            println!("seg type: {} lang {}", keyseg_buf[0], keyseg_buf[1]);
             keysegs_left -= 1;
         }
         uniques -= 1;
@@ -111,83 +146,172 @@ fn read_table_header(index_file: &String) -> Result<MITableHeader> {
     }
     let mut fields_left = fields;
     let mut fieldrec_buf = [0u8; 7];
+    let mut recdefs = Vec::new();
     while 0 != fields_left {
         index.read(&mut fieldrec_buf);
-        println!("field: {}, type: {}, length: {}",
-                 fields - fields_left,
-                 to_u32(&fieldrec_buf[0..2]),
-                 to_u32(&fieldrec_buf[2..4]));
+        let recdef = MIRecDef {
+            rtype: to_u32(&fieldrec_buf[0..2]) as i16,
+            length: to_u32(&fieldrec_buf[2..4]) as u16
+        };
+        recdefs.push(recdef);
         fields_left -= 1;
     }
-    println!("keys {} base pos {:x} offset {:x}", header.uniques, header.base_pos, offset);
-    Ok(header)
+    Ok(MITableState{header: header, base: MITableBase{records: recdefs}})
 }
 
 fn to_u32(source: &[u8]) -> u32 {
-    source.iter().fold(0, |acc, &b| acc*256 + b as u32)
+    to_u64(source) as u32
 }
 
-fn read_table_records(files: &MITableFiles) -> Result<u64> {
+fn to_u64(source: &[u8]) -> u64 {
+    source.iter().fold(0, |acc, &b| acc*256 + b as u64)
+}
+
+fn read_table_records(files: &MITableFiles, block_types: &[Option<MIRecordBlockDef>])
+                      -> Result<u64> {
     let mut records = 0;
-    let header = read_table_header(&files.index)?;
+    let state = read_table_state(&files.index)?;
     let mut table = File::open(&files.data)?;
     let mut block_type_buf = [0];
-    let mut block_header = [0; 20];
+    const max_header_len: usize = 20;
+    let mut block_header = [0; max_header_len];
     let mut position = 0;
+    let mut result = Ok(records);
     while 0 != table.read(&mut block_type_buf)? {
         let block_type = block_type_buf[0];
-        let header_len = match block_type {
-            0  => 20,
-            1  => 3,
-            2  => 4,
-            3  => 4,
-            4  => 5,
-            5  => 13,
-            6  => 15,
-            7  => 3,
-            8  => 4,
-            9  => 4,
-            10 => 5,
-            11 => 11,
-            12 => 12,
-            13 => 16,
-            _  => 3
-        };
-        table.read(&mut block_header[0..(header_len-1)]);
-        let length_bytes = block_header_block_length_bytes(block_type, &block_header);
-        let data_len = length_bytes.iter().fold(0, |acc, &b| acc*256 + b as u32);
-        //println!("block at {:016x} type: {} len: {}", position, block_type, data_len);
-        let offset = if block_type == 0 {
-            0
-        } else if block_type == 3 || block_type == 9 {
-            (data_len + block_header[length_bytes.len()] as u32) as i64
-        } else {
-            data_len as i64
-        };
-        table.seek(SeekFrom::Current(offset));
-        position += offset + (header_len as i64);
-        records += 1;
+        match block_types[block_type as usize] {
+            None => {
+                let msg = format!("unknown block type: {}", block_type);
+                result = Err(Error::new(ErrorKind::Other, msg));
+                break;
+            },
+            Some(block_definition) => {
+                let header_length = block_definition.header_len as u32;
+                let header_size = header_length as usize;
+                table.read(&mut block_header[0..header_size]);
+                let block_info = read_block_info(&block_header[0..header_size], &block_definition);
+                println!("block at {:016x} type: {} len: {}", position, block_type, block_info.block_len);
+                table.seek(SeekFrom::Current(block_info.block_len as i64));
+                position += block_info.block_len + header_length + (block_type_buf.len() as u32);
+                records += 1;
+                result = Ok(records)
+            }
+        }
     }
-    Ok(records)
+    result
 }
 
-fn block_header_block_length_bytes(block_type: u8, header: &[u8]) -> &[u8] {
-    let (start, end) = match block_type {
-        0  => (0, 3),
-        1  => (0, 2),
-        2  => (0, 2),
-        3  => (0, 2),
-        4  => (0, 3),
-        5  => (2, 4),
-        6  => (3, 6),
-        7  => (0, 2),
-        8  => (0, 3),
-        9  => (0, 2),
-        10 => (0, 3),
-        11 => (0, 2),
-        12 => (0, 3),
-        13 => (4, 7),
-        _  => (0, 2)
+fn read_block_info(header: &[u8], block_definition: &MIRecordBlockDef) -> MIRecordBlock {
+    let record_len = find_header_bytes(header, block_definition.record_len);
+    let data_len = find_header_bytes(header, block_definition.data_len);
+    let unused_len = find_header_bytes(header, block_definition.unused_len);
+    let block_len = if unused_len.is_some() {
+        unused_len.unwrap() + data_len.unwrap()
+    } else if !block_definition.deleted {
+        data_len.unwrap()
+    } else {
+        let deleted_block_len = find_header_bytes(header, block_definition.block_len);
+        deleted_block_len.unwrap() - (block_definition.header_len as u64)
     };
-    &header[start..end]
+    let convert_to_u32 = |n| n as u32;
+    MIRecordBlock {
+        deleted: block_definition.deleted,
+        block_len: block_len as u32,
+        record_len: record_len.map(&convert_to_u32),
+        data_len: data_len.map(&convert_to_u32),
+        unused_len: unused_len.map(&convert_to_u32),
+        next_filepos: find_header_bytes(header, block_definition.unused_len)
+    }
+}
+
+fn find_header_bytes(header: &[u8], position: Option<BytePos>) -> Option<u64> {
+    position.map(|(start, end)| to_u64(&header[start..end]))
+}
+
+fn record_block_definitions() -> [Option<MIRecordBlockDef>; 256] {
+    let mut definitions = [None; 256];
+    definitions[0] = Some(MIRecordBlockDef {
+        record_len: None,
+        block_len: Some((0, 3)),
+        data_len: None,
+        unused_len: None,
+        next_filepos: Some((3, 11)),
+        header_len: 19,
+        deleted: true
+    });
+    let small_full_pos = Some((0, 2));
+    let big_full_pos = Some((0, 3));
+    definitions[1] = Some(MIRecordBlockDef {
+        record_len: small_full_pos,
+        block_len: small_full_pos,
+        data_len: small_full_pos,
+        unused_len: None,
+        next_filepos: None,
+        header_len: 2,
+        deleted: false
+    });
+    definitions[2] = Some(MIRecordBlockDef {
+        record_len: big_full_pos,
+        block_len: big_full_pos,
+        data_len: big_full_pos,
+        unused_len: None,
+        next_filepos: None,
+        header_len: 3,
+        deleted: false
+    });
+    definitions[3] = Some(MIRecordBlockDef {
+        record_len: small_full_pos,
+        block_len: None,
+        data_len: small_full_pos,
+        unused_len: Some((2,3)),
+        next_filepos: None,
+        header_len: 3,
+        deleted: false
+    });
+    definitions[4] = Some(MIRecordBlockDef {
+        record_len: big_full_pos,
+        block_len: None,
+        data_len: big_full_pos,
+        unused_len: Some((3,4)),
+        next_filepos: None,
+        header_len: 4,
+        deleted: false
+    });
+    definitions[5] = Some(MIRecordBlockDef {
+        record_len: small_full_pos,
+        block_len: Some((2, 4)),
+        data_len: Some((2, 4)),
+        unused_len: None,
+        next_filepos: Some((4, 12)),
+        header_len: 12,
+        deleted: false
+    });
+    definitions[7] = Some(MIRecordBlockDef {
+        record_len: None,
+        block_len: small_full_pos,
+        data_len: small_full_pos,
+        unused_len: None,
+        next_filepos: None,
+        header_len: 2,
+        deleted: false
+    });
+    definitions[9] = Some(MIRecordBlockDef {
+        record_len: None,
+        block_len: None,
+        data_len: small_full_pos,
+        unused_len: Some((2, 3)),
+        next_filepos: None,
+        header_len: 3,
+        deleted: false
+    });
+    definitions[11] = Some(MIRecordBlockDef {
+        record_len: None,
+        block_len: small_full_pos,
+        data_len: small_full_pos,
+        unused_len: None,
+        next_filepos: Some((2, 10)),
+        header_len: 10,
+        deleted: false
+    });
+    definitions
 }
