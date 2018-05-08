@@ -175,8 +175,11 @@ fn read_table_records(files: &MITableFiles, block_types: &[Option<MIRecordBlockD
     let mut block_type_buf = [0];
     const max_header_len: usize = 20;
     let mut block_header = [0; max_header_len];
-    let mut position = 0;
+    let mut position = 0u64;
+    let mut saved_position = None;
     let mut result = Ok(records);
+    let mut record = Vec::new();
+    let mut record_pos: usize = 0;
     while 0 != table.read(&mut block_type_buf)? {
         let block_type = block_type_buf[0];
         match block_types[block_type as usize] {
@@ -189,10 +192,41 @@ fn read_table_records(files: &MITableFiles, block_types: &[Option<MIRecordBlockD
                 let header_length = block_definition.header_len as u32;
                 let header_size = header_length as usize;
                 table.read(&mut block_header[0..header_size]);
+                position += (block_type_buf.len() as u32 + header_length) as u64;
                 let block_info = read_block_info(&block_header[0..header_size], &block_definition);
                 println!("block at {:016x} type: {} len: {}", position, block_type, block_info.block_len);
+                if block_info.record_len.is_some() {
+                    let record_len = block_info.record_len.unwrap() as usize;
+                    record_pos = 0;
+                    record.resize(record_len, 0u8);
+                }
+                let should_read = block_info.data_len.is_some() && (block_info.record_len.is_some() || saved_position.is_some());
+                if should_read {
+                    let data_len = block_info.data_len.unwrap() as usize;
+                    table.read(&mut record.as_mut_slice()[record_pos..(record_pos + data_len)]);
+                    record_pos += data_len;
+                    table.seek(SeekFrom::Current(-(data_len as i64)));
+                }
                 table.seek(SeekFrom::Current(block_info.block_len as i64));
-                position += block_info.block_len + header_length + (block_type_buf.len() as u32);
+                position += block_info.block_len as u64;
+                if block_info.next_filepos.is_some() {
+                    if should_read {
+                        let next_pos = block_info.next_filepos.unwrap();
+                        if saved_position.is_none() {
+                            saved_position = Some(position);
+                        }
+                        position = next_pos;
+                        table.seek(SeekFrom::Start(next_pos));
+                    }
+                } else if saved_position.is_some() {
+                    let next_pos = saved_position.unwrap();
+                    position = next_pos;
+                    saved_position = None;
+                    table.seek(SeekFrom::Start(next_pos));
+                }
+                if should_read && block_info.next_filepos.is_none() {
+                    println!("record len: {}", record.len());
+                }
                 records += 1;
                 result = Ok(records)
             }
@@ -220,7 +254,7 @@ fn read_block_info(header: &[u8], block_definition: &MIRecordBlockDef) -> MIReco
         record_len: record_len.map(&convert_to_u32),
         data_len: data_len.map(&convert_to_u32),
         unused_len: unused_len.map(&convert_to_u32),
-        next_filepos: find_header_bytes(header, block_definition.unused_len)
+        next_filepos: find_header_bytes(header, block_definition.next_filepos)
     }
 }
 
