@@ -5,6 +5,13 @@ use std::io::prelude::*;
 use std::io::{Result, SeekFrom, Error, ErrorKind};
 use std::sync::mpsc::{self, Sender, Receiver};
 use std::thread;
+use std::string::String;
+use base64::encode;
+use serde::ser::{Serializer, SerializeSeq};
+
+extern crate base64;
+extern crate serde;
+extern crate serde_json;
 
 static INDEX_EXT: &str = ".MYI";
 static DATA_EXT: &str = ".MYD";
@@ -49,7 +56,8 @@ struct MIRecDef {
 }
 
 struct MITableBase {
-    records: Vec<MIRecDef>
+    records: Vec<MIRecDef>,
+    pack_bits: u16
 }
 
 struct MITableState {
@@ -90,9 +98,10 @@ fn main() {
     let table_name = &args[2];
     let files = find_table_files(directory, table_name);
     let block_types = record_block_definitions();
+    let state = read_table_state(&files.index).unwrap();
     let (tx, rx) = mpsc::channel();
     let writer = thread::spawn(move || read_table_records(&files, &block_types, tx).unwrap());
-    write_records(rx);
+    write_records(&state, rx);
 }
 
 fn find_table_files(directory: &String, table_name: &String) -> MITableFiles {
@@ -104,12 +113,65 @@ fn find_table_files(directory: &String, table_name: &String) -> MITableFiles {
     }
 }
 
-fn write_records(reader: Receiver<Vec<u8>>) {
+fn write_records(state: &MITableState, reader: Receiver<Vec<u8>>) {
     let mut messages = 0;
+    let stdout = std::io::stdout();
+    let mut ser = serde_json::Serializer::new(stdout);
+    let mut json_records = ser.serialize_seq(None).unwrap();
     for message in reader.iter() {
+        let fields = parse_record(&message, &state.base);
+        json_records.serialize_element(&fields);
         messages += 1;
     }
-    println!("read {} records", messages);
+    json_records.end();
+}
+
+fn parse_record(record: &Vec<u8>, base: &MITableBase) -> Vec<String> {
+    let recdefs = &base.records;
+    let mut pos = base.pack_bits as usize;
+    let flag = to_u64_little(&record[0..pos]);
+    let mut bit = 1u64;
+    let mut fields = Vec::new();
+    for recdef in recdefs {
+        let mut recdef_length = recdef.length as usize;
+        let has_dynamic_length = match recdef.rtype {
+            8 => true,
+            4 => true,
+            _ => false
+        };
+        if bit & flag != 0 && recdef.rtype != 8 {
+            ()
+        }
+        else if has_dynamic_length {
+            let old_pos = pos;
+            if recdef.rtype == 8 {
+                let length = if recdef_length <= 256 {
+                    pos += 1;
+                    record[old_pos] as u64
+                } else {
+                    pos += 3;
+                    to_u64(&record[old_pos+1..(old_pos+3)])
+                };
+                fields.push(String::from_utf8((&record[pos..(pos + length as usize)]).to_vec()).unwrap());
+                pos += length as usize;
+            }
+            if recdef.rtype == 4 {
+                let portable_uchar_size = 8;
+                let size_length = recdef_length - portable_uchar_size;
+                pos += size_length;
+                let length = to_u64_little(&record[old_pos..(old_pos + size_length)]);
+                fields.push(String::from_utf8((&record[pos..(pos + length as usize)]).to_vec()).unwrap());
+                pos += length as usize;
+            }
+        } else {
+            fields.push(base64::encode(&record[pos..(pos + recdef_length)]));
+            pos += recdef_length;
+        }
+        if recdef.rtype == 4 || recdef.rtype == 3 {
+            bit <<= 1;
+        }
+    }
+    fields
 }
 
 fn read_table_state(index_file: &String) -> Result<MITableState> {
@@ -137,7 +199,11 @@ fn read_table_state(index_file: &String) -> Result<MITableState> {
     while 0 != keys {
         let read = index.read(&mut keydef_buf)?;
         let keysegs = keydef_buf[0] as i64;
-        index.seek(SeekFrom::Current(keysegs * 18))?;
+        let mut keysegs_left = keysegs;
+        while 0 != keysegs_left {
+            index.read(&mut keyseg_buf)?;
+            keysegs_left -= 1;
+        }
         keys -= 1;
         offset += keysegs * 18 + (read as i64);
     }
@@ -165,7 +231,11 @@ fn read_table_state(index_file: &String) -> Result<MITableState> {
         recdefs.push(recdef);
         fields_left -= 1;
     }
-    Ok(MITableState{header: header, base: MITableBase{records: recdefs}})
+    let base = MITableBase{
+        records: recdefs,
+        pack_bits: to_u32(&base_info_buf[76..78]) as u16
+    };
+    Ok(MITableState{header: header, base: base})
 }
 
 fn to_u32(source: &[u8]) -> u32 {
@@ -176,10 +246,13 @@ fn to_u64(source: &[u8]) -> u64 {
     source.iter().fold(0, |acc, &b| acc*256 + b as u64)
 }
 
+fn to_u64_little(source: &[u8]) -> u64 {
+    source.iter().rev().fold(0, |acc, &b| acc*256 + b as u64)
+}
+
 fn read_table_records(files: &MITableFiles, block_types: &[Option<MIRecordBlockDef>],
                       writer: Sender<Vec<u8>>) -> Result<u64> {
     let mut records = 0;
-    let state = read_table_state(&files.index)?;
     let mut table = File::open(&files.data)?;
     let mut block_type_buf = [0];
     const max_header_len: usize = 20;
@@ -203,7 +276,7 @@ fn read_table_records(files: &MITableFiles, block_types: &[Option<MIRecordBlockD
                 table.read(&mut block_header[0..header_size]);
                 position += (block_type_buf.len() as u32 + header_length) as u64;
                 let block_info = read_block_info(&block_header[0..header_size], &block_definition);
-                println!("block at {:016x} type: {} len: {}", position, block_type, block_info.block_len);
+                /*println!("block at {:016x} type: {} len: {}", position, block_type, block_info.block_len);*/
                 if block_info.record_len.is_some() {
                     let record_len = block_info.record_len.unwrap() as usize;
                     record_pos = 0;
